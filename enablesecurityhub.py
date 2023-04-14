@@ -39,19 +39,15 @@ def assume_role(aws_account_number, role_name):
 
     # Beginning the assume role process for account
     sts_client = boto3.client('sts')
-    
+
     # Get the current partition
     partition = sts_client.get_caller_identity()['Arn'].split(":")[1]
-    
+
     response = sts_client.assume_role(
-        RoleArn='arn:{}:iam::{}:role/{}'.format(
-            partition,
-            aws_account_number,
-            role_name
-        ),
-        RoleSessionName='EnableSecurityHub'
+        RoleArn=f'arn:{partition}:iam::{aws_account_number}:role/{role_name}',
+        RoleSessionName='EnableSecurityHub',
     )
-    
+
     # Storing STS credentials
     session = boto3.Session(
         aws_access_key_id=response['Credentials']['AccessKeyId'],
@@ -59,9 +55,7 @@ def assume_role(aws_account_number, role_name):
         aws_session_token=response['Credentials']['SessionToken']
     )
 
-    print("Assumed session for {}.".format(
-        aws_account_number
-    ))
+    print(f"Assumed session for {aws_account_number}.")
 
     return session
 
@@ -73,24 +67,23 @@ def get_master_members(sh_client, aws_region):
     :return: dict of AwsAccountId:RelationshipStatus
     """
 
-    member_dict = dict()
-
     results = sh_client.list_members(
         OnlyAssociated=False
     )
-    
-    for member in results['Members']:
-        member_dict.update({member['AccountId']: member['MemberStatus']})
-        
+
+    member_dict = {
+        member['AccountId']: member['MemberStatus']
+        for member in results['Members']
+    }
     while results.get("NextToken"):
         results = sh_client.list_members(
             OnlyAssociated=False,
             NextToken=results['NextToken']
         )
-        
+
         for member in results['Members']:
-            member_dict.update({member['AccountId']: member['MemberStatus']})
-            
+            member_dict[member['AccountId']] = member['MemberStatus']
+
     return member_dict
 
 
@@ -104,37 +97,45 @@ def check_config(session,account, region, s3_bucket_name):
     try: 
         iam.create_service_linked_role(AWSServiceName='config.amazonaws.com', Description='A service-linked role required for AWS Config')
     except ClientError as e:
-        if e.response['ResponseMetadata']['HTTPStatusCode'] == 400:
-            pass # SLR already exists
-        else:
+        if e.response['ResponseMetadata']['HTTPStatusCode'] != 400:
             print(e)
             return False
     # Check if default bucket name is available.
     try:
-        s3.list_objects(Bucket='config-bucket-{}'.format(account), MaxKeys=1)
+        s3.list_objects(Bucket=f'config-bucket-{account}', MaxKeys=1)
         default_bucket_exists = True
-        s3_bucket_name = 'config-bucket-{}'.format(account)
+        s3_bucket_name = f'config-bucket-{account}'
     except ClientError as e:
         if e.response['ResponseMetadata']['HTTPStatusCode'] == 404:
             default_bucket_avail = True
-            s3_bucket_name = 'config-bucket-{}'.format(account)
-        pass
+            s3_bucket_name = f'config-bucket-{account}'
     if not len(config.describe_configuration_recorders()['ConfigurationRecorders']):
-        config.put_configuration_recorder( ConfigurationRecorder={'name':'default','roleARN': 'arn:aws:iam::%s:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig' % account,'recordingGroup': {'allSupported' : True, 'includeGlobalResourceTypes': True}})
-    
+        config.put_configuration_recorder(
+            ConfigurationRecorder={
+                'name': 'default',
+                'roleARN': f'arn:aws:iam::{account}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig',
+                'recordingGroup': {
+                    'allSupported': True,
+                    'includeGlobalResourceTypes': True,
+                },
+            }
+        )
+
     if config.describe_configuration_recorder_status()['ConfigurationRecordersStatus'][0]['recording']:
         return True #config is configured and enabled nothing to do here.
     if len(config.describe_delivery_channels()['DeliveryChannels']):
         try: 
             config.start_configuration_recorder(ConfigurationRecorderName=config.describe_configuration_recorder_status()['ConfigurationRecordersStatus'][0]['name'])
-            return True 
+            return True
         except ClientError as e:
-            print("Error {} starting configuration recorder for account {} in region {}".format(repr(e), account, region))
+            print(
+                f"Error {repr(e)} starting configuration recorder for account {account} in region {region}"
+            )
             return False
-    ## Ensure S3 bucket for AWS Config delivery exists 
+    ## Ensure S3 bucket for AWS Config delivery exists
     if default_bucket_avail and not default_bucket_exists:
         try:
-            s3.create_bucket(Bucket=s3_bucket_name) 
+            s3.create_bucket(Bucket=s3_bucket_name)
             bucket_policy = {
                 "Version": "2012-10-17",
                 "Statement": [
@@ -143,20 +144,28 @@ def check_config(session,account, region, s3_bucket_name):
                         "Effect": "Allow",
                         "Principal": {"Service": ["config.amazonaws.com"]},
                         "Action": "s3:GetBucketAcl",
-                        "Resource": "arn:aws:s3:::%s" % s3_bucket_name},
+                        "Resource": f"arn:aws:s3:::{s3_bucket_name}",
+                    },
                     {
                         "Sid": " AWSConfigBucketDelivery",
                         "Effect": "Allow",
                         "Principal": {"Service": ["config.amazonaws.com"]},
                         "Action": "s3:PutObject",
-                        "Resource": "arn:aws:s3:::%s/AWSLogs/%s/Config/*" % (s3_bucket_name, account),
-                        "Condition": { "StringEquals": { "s3:x-amz-acl": "bucket-owner-full-control" }}
-                    }]
+                        "Resource": f"arn:aws:s3:::{s3_bucket_name}/AWSLogs/{account}/Config/*",
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-acl": "bucket-owner-full-control"
+                            }
+                        },
+                    },
+                ],
             }
             bucket_policy = json.dumps(bucket_policy)
             s3.put_bucket_policy(Bucket=s3_bucket_name, Policy=bucket_policy)
         except ClientError as e:
-            print("Error {} checking bucket for Config delivery in account {}".format(repr(e), account))
+            print(
+                f"Error {repr(e)} checking bucket for Config delivery in account {account}"
+            )
             return False
     try:
         config.put_delivery_channel(DeliveryChannel={
@@ -167,7 +176,7 @@ def check_config(session,account, region, s3_bucket_name):
         config.start_configuration_recorder(ConfigurationRecorderName=config.describe_configuration_recorder_status()['ConfigurationRecordersStatus'][0]['name'])
         return True
     except ClientError as e:
-        print("Error {} enabling Config on account {}".format(repr(e), account))
+        print(f"Error {repr(e)} enabling Config on account {account}")
         return False
     return False
         
@@ -189,10 +198,10 @@ if __name__ == '__main__':
     # Validate master accountId
     if not re.match(r'[0-9]{12}',args.master_account):
         raise ValueError("Master AccountId is not valid")
-    
+
     # Generate dict with account & email information
     aws_account_dict = OrderedDict()
-    
+
     # Notify on Config dependency if standards are enabled
     if args.enable_standards:
         print(
@@ -213,40 +222,44 @@ if __name__ == '__main__':
         if 'yes' not in raw_input(notify_config_response).lower():
             print("Exiting..")
             raise SystemExit(0)
-     
+
     for acct in args.input_file.readlines():
         split_line = acct.rstrip().split(",")
         if len(split_line) < 2:
-            print("Unable to process line: {}".format(acct))
+            print(f"Unable to process line: {acct}")
             continue
-            
+
         if not re.match(r'[0-9]{12}', str(split_line[0])):
-            print("Invalid account number {}, skipping".format(split_line[0]))
+            print(f"Invalid account number {split_line[0]}, skipping")
             continue
-            
+
         aws_account_dict[split_line[0]] = split_line[1]
 
     # Check length of accounts to be processed
     if len(aws_account_dict.keys()) > 1000:
         raise Exception("Only 1000 accounts can be linked to a single master account")
-    
+
     # Getting SecurityHub regions
     session = boto3.session.Session()
 
     securityhub_regions = []
     if args.enabled_regions:
         securityhub_regions = [str(item) for item in args.enabled_regions.split(',')]
-        print("Enabling members in these regions: {}".format(securityhub_regions))
+        print(f"Enabling members in these regions: {securityhub_regions}")
     else:
         securityhub_regions = session.get_available_regions('securityhub')
-        print("Enabling members in all available SecurityHub regions {}".format(securityhub_regions))
-    
+        print(
+            f"Enabling members in all available SecurityHub regions {securityhub_regions}"
+        )
+
     # Check if enable Standards 
     standards_arns = []
     if args.enable_standards:
         standards_arns = [str(item) for item in args.enable_standards.split(',')]
-        print("Enabling the following Security Hub Standards for enabled account(s) and region(s): {}".format(standards_arns))
-        
+        print(
+            f"Enabling the following Security Hub Standards for enabled account(s) and region(s): {standards_arns}"
+        )
+                
 
     # Processing Master account
     master_session = assume_role(args.master_account, args.assume_role)
@@ -258,9 +271,7 @@ if __name__ == '__main__':
         try: 
             master_clients[aws_region].enable_security_hub()
         except ClientError as e:
-            if e.response['Error']['Code'] == 'ResourceConflictException':
-                pass
-            else:
+            if e.response['Error']['Code'] != 'ResourceConflictException':
                 print("Error: Unable to enable Security Hub on Master account in region {}").format(aws_region)
                 raise SystemExit(0)
 
@@ -272,25 +283,22 @@ if __name__ == '__main__':
         try:
             session = assume_role(account, args.assume_role)
             # Generate unique bucket name for Config delivery channel if default is not avaialable.
-            s3_bucket_name = 'config-bucket-{}-{}'.format(''.join(random.SystemRandom().choice(string.ascii_lowercase + string.digits) for _ in range(5)), account)
-            
+            s3_bucket_name = f"config-bucket-{''.join(random.SystemRandom().choice(string.ascii_lowercase + string.digits) for _ in range(5))}-{account}"
+
             for aws_region in securityhub_regions:
                 print('Beginning {account} in {region}'.format(
                     account=account,
                     region=aws_region
                 ))
-                
+
                 sh_client = session.client('securityhub', region_name=aws_region)
-                #Ensure AWS Config is enabled for the account/region and enable if it not already enabled.
-                config_result = check_config(session, account, aws_region, s3_bucket_name)
-                if not config_result:
-                    failed_accounts.append({account: "Error validating or enabling AWS Config for account {} in {} - requested standards not enabled".format(account,aws_region)})
-                else:
+                if config_result := check_config(
+                    session, account, aws_region, s3_bucket_name
+                ):
                     try:
                         sh_client.enable_security_hub()
                     except ClientError as e:
-                        if e.response['Error']['Code'] == 'ResourceConflictException':
-                            pass
+                        pass
                     for standard in standards_arns:
                         sh_client.batch_enable_standards(StandardsSubscriptionRequests=[{'StandardsArn' : standard}])
                         start_time = int(time.time())
@@ -304,37 +312,44 @@ if __name__ == '__main__':
                                 if enabled_stanard['StandardsArn'] == standard:
                                     status = enabled_stanard['StandardsStatus']
                         if status == 'READY':
-                            print("Finished enabling stanard {} on account {} for region {}".format(standard,account, aws_region))
-                                
-                    
+                            print(
+                                f"Finished enabling stanard {standard} on account {account} for region {aws_region}"
+                            )
+                                                            
+                                                
 
+                else:
+                    failed_accounts.append(
+                        {
+                            account: f"Error validating or enabling AWS Config for account {account} in {aws_region} - requested standards not enabled"
+                        }
+                    )
                 if account not in members[aws_region]:
-        
+                        
                     master_clients[aws_region].create_members(
                         AccountDetails=[{
                             "AccountId": account,
                             "Email": aws_account_dict[account]
                         }]
                     )
-                
+
                     print('Added Account {monitored} to member list in SecurityHub master account {master} for region {region}'.format(
                         monitored=account,
                         master=args.master_account,
                         region=aws_region
                     ))
-                                
+
                     start_time = int(time.time())
                     while account not in members[aws_region]:
                         if (int(time.time()) - start_time) > 300:
-                            print("Membership did not show up for account {}, skipping".format(account))
-                            failed_accounts.append({
-                                account: "Membership did not show up for account {} in {}".format(
-                                    account,
-                                    aws_region
-                                )
-                            })
+                            print(f"Membership did not show up for account {account}, skipping")
+                            failed_accounts.append(
+                                {
+                                    account: f"Membership did not show up for account {account} in {aws_region}"
+                                }
+                            )
                             break
-                        
+
                         time.sleep(5)
                         members[aws_region] = get_master_members(master_clients[aws_region], aws_region)
 
@@ -344,47 +359,46 @@ if __name__ == '__main__':
                         master=args.master_account,
                         region=aws_region
                     ))
-                
+
                 if members[aws_region][account] == 'Associated':
                     # Member is enabled and already being monitored
                     print('Account {account} is already enabled'.format(account=account))
-                
+
                 else:
                     start_time = int(time.time())
                     while members[aws_region][account] != 'Associated':
                         if (int(time.time()) - start_time) > 300:
-                            print("Invitation did not show up for account {}, skipping".format(account))
-                            failed_accounts.append({
-                                account: "Membership did not show up for account {} in {}".format(
-                                    account,
-                                    aws_region
-                                )
-                            })
+                            print(f"Invitation did not show up for account {account}, skipping")
+                            failed_accounts.append(
+                                {
+                                    account: f"Membership did not show up for account {account} in {aws_region}"
+                                }
+                            )
                             break
-                        
+
                         if members[aws_region][account] == 'Created':
                             # Member has been created in the SecurityHub master account but not invited yet
                             master_clients[aws_region].invite_members(
                                 AccountIds=[account]
                             )
-                        
+
                             print('Invited Account {monitored} to SecurityHub master account {master} in region {region}'.format(
                                 monitored=account,
                                 master=args.master_account,
                                 region=aws_region
                             ))
-        
+
                         if members[aws_region][account] == 'Invited':
                             # member has been invited so accept the invite
-                            
+
                             response = sh_client.list_invitations()
-                            
-                            invitation_dict = dict()
-                            
+
+                            invitation_dict = {}
+
                             invitation_id = None
                             for invitation in response['Invitations']:
                                 invitation_id = invitation['InvitationId']
-                            
+
                             if invitation_id is not None:
                                 sh_client.accept_invitation(
                                     InvitationId=invitation_id,
@@ -395,25 +409,22 @@ if __name__ == '__main__':
                                     master=args.master_account,
                                     region=aws_region
                                 ))
-    
+
                         # Refresh the member dictionary
                         members[aws_region] = get_master_members(master_clients[aws_region], aws_region)
-                        
+
                     print('Finished {account} in {region}'.format(account=account, region=aws_region))
-                    
+
         except ClientError as e:
-            print("Error Processing Account {}".format(account))
+            print(f"Error Processing Account {account}")
             failed_accounts.append({
                 account: repr(e)
             })
 
-    if len(failed_accounts) > 0:
+    if failed_accounts:
         print("---------------------------------------------------------------")
         print("Failed Accounts")
         print("---------------------------------------------------------------")
         for account in failed_accounts:
-            print("{}: \n\t{}".format(
-                account.keys()[0],
-                account[account.keys()[0]]
-            ))
+            print(f"{account.keys()[0]}: \n\t{account[account.keys()[0]]}")
             print("---------------------------------------------------------------")
